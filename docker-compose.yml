@@ -1,0 +1,6 @@
+services:
+  cs:
+    build: .
+    image: cs
+    volumes:
+      - ${PWD}:/workspace
