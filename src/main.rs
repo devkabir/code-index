@@ -1,7 +1,7 @@
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
-use std::{env, fs, io::{self, BufRead, Write}, path::Path};
-use tantivy::{collector::TopDocs, doc, query::QueryParser, schema::{Value as _, *}, Index, ReloadPolicy};
+use std::{env, fs, io::{self, BufRead, Write}, ops::Bound, path::Path};
+use tantivy::{collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery}, schema::{Value as _, *}, Index, ReloadPolicy, Term};
 
 const INDEX_DIR: &str = ".code-index";
 
@@ -91,7 +91,7 @@ fn build_index() -> tantivy::Result<usize> {
     Ok(count)
 }
 
-fn search(query_str: &str, limit: usize) -> tantivy::Result<String> {
+fn search(query_str: &str, folder: &str, limit: usize) -> tantivy::Result<String> {
     if !Path::new(INDEX_DIR).join("meta.json").exists() {
         build_index()?;
     }
@@ -100,6 +100,16 @@ fn search(query_str: &str, limit: usize) -> tantivy::Result<String> {
     let searcher = reader.searcher();
     let qp = QueryParser::for_index(&index, vec![f_path, f_body]);
     let (q, _) = qp.parse_query_lenient(query_str);
+    let folder = folder.trim_start_matches("./").trim_end_matches('/');
+    let q: Box<dyn Query> = if folder.is_empty() {
+        q
+    } else {
+        let in_folder = RangeQuery::new(
+            Bound::Included(Term::from_field_text(f_path, &format!("{folder}/"))),
+            Bound::Excluded(Term::from_field_text(f_path, &format!("{folder}/\u{10ffff}"))),
+        );
+        Box::new(BooleanQuery::new(vec![(Occur::Must, q), (Occur::Must, Box::new(in_folder))]))
+    };
     let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
     let q_terms: Vec<String> = query_str
         .split(|c: char| !c.is_alphanumeric() && c != '_')
@@ -147,7 +157,10 @@ fn run_mcp() {
                         "description": "Search minified code index (.code-index); returns compact # file and L#:code lines",
                         "inputSchema": {
                             "type": "object",
-                            "properties": { "query": { "type": "string" } },
+                            "properties": {
+                                "query": { "type": "string" },
+                                "folder": { "type": "string", "description": "Only return files under this folder, relative to the index root" }
+                            },
                             "required": ["query"]
                         }
                     },
@@ -165,7 +178,8 @@ fn run_mcp() {
                 }
                 _ => {
                     let q = req["params"]["arguments"]["query"].as_str().unwrap_or("");
-                    let hits = search(q, 10).unwrap_or_default();
+                    let folder = req["params"]["arguments"]["folder"].as_str().unwrap_or("");
+                    let hits = search(q, folder, 10).unwrap_or_default();
                     json!({ "content": [{ "type": "text", "text": hits }] })
                 }
             },
@@ -183,7 +197,7 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("index") => println!("Indexed {} files into {}", build_index().unwrap(), INDEX_DIR),
         Some("mcp") => run_mcp(),
-        Some(q) => print!("{}", search(q, 10).unwrap()),
-        None => eprintln!("Usage: cs <index | mcp | \"search query\">"),
+        Some(q) => print!("{}", search(q, args.get(2).map_or("", |s| s.as_str()), 10).unwrap()),
+        None => eprintln!("Usage: cs <index | mcp | \"search query\" [folder]>"),
     }
 }

@@ -17,6 +17,7 @@ Run `cs` from the directory you want to search. It indexes and searches the curr
 ```bash
 cs index            # build or rebuild the index
 cs "add_action"     # search
+cs "add_action" wp-content/plugins   # search only inside one folder
 cs mcp              # run as an MCP server on stdio
 ```
 
@@ -51,13 +52,50 @@ node_modules/
 - Terms separated by spaces are OR'd.
 - One identifier such as `register_routes` or `ip-lockout` matches as a whole.
 - A query that contains `:` returns nothing. Search `Foo bar` instead of `Foo::bar`.
+- A folder after the query limits the results to files under that folder. The folder is relative to the directory that was indexed.
 
 ## MCP tools
 
 | Tool | Arguments | Result |
 | :--- | :--- | :--- |
-| `search_code` | `query` (string) | Same text as the CLI search |
+| `search_code` | `query` (string), optional `folder` (string) | Same text as the CLI search |
 | `index_code` | none | Rebuilds the index |
+
+### Register the server
+
+The server searches the directory it starts in, so each client must start it in the directory you want to search. Replace `/path/to/cs` with the binary and `/path/to/project` with that directory.
+
+Claude Code, `.mcp.json` in the project root (Claude Code starts the server in the project):
+
+```json
+{
+  "mcpServers": {
+    "cs": { "command": "/path/to/cs", "args": ["mcp"] }
+  }
+}
+```
+
+Codex, `.codex/config.toml` in a trusted project, or `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cs]
+command = "/path/to/cs"
+args = ["mcp"]
+cwd = "/path/to/project"
+```
+
+Antigravity, the global `~/.gemini/config/mcp_config.json` (older versions: `~/.gemini/antigravity/mcp_config.json`). Add `cs` inside the existing `mcpServers` object:
+
+```json
+{
+  "mcpServers": {
+    "cs": {
+      "command": "sh",
+      "args": ["-c", "cd /path/to/project && exec /path/to/cs mcp"]
+    }
+  }
+}
+```
 
 ## Docker
 
