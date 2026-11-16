@@ -1,6 +1,6 @@
-# cs
+# Code search
 
-A small code search engine for AI agents. It strips comments and whitespace from source files, indexes them with [tantivy](https://github.com/quickwit-oss/tantivy), and returns matching lines in a compact text format.
+Code search is a small code search engine for AI agents. It strips comments and indentation from source files, indexes them with [tantivy](https://github.com/quickwit-oss/tantivy), and returns matching lines and full definitions in a compact text format.
 
 ## Build
 
@@ -12,7 +12,7 @@ The binary is `target/release/cs`.
 
 ## Use
 
-Run `cs` from the directory you want to search. It indexes and searches the current directory, and stores the index in `./.code-index`.
+Run `cs` from the directory you want to search. Code search indexes and searches the current directory, and it stores the index in `./.code-index`.
 
 ```bash
 cs index            # build or rebuild the index
@@ -21,27 +21,40 @@ cs "add_action" wp-content/plugins   # search only inside one folder
 cs mcp              # run as an MCP server on stdio
 ```
 
-The first search builds the index if none exists. After that, the index is only updated by `cs index`.
+The first search builds the index if none exists. After that, only `cs index` updates the index.
 
 ## Output
 
-`# <path>` names a file. `L<line>:<code>` is a matching line with its line number in the original file.
+`# <path>` names a file. `L<line>:<code>` is a matching line with its line number in the original file. When a line defines a query term with `function`, `class`, `interface`, `trait`, `enum`, `struct`, `fn`, or `def`, code search prints `[def]` followed by the whole block up to its closing brace, up to 80 lines. Code search lists files with a definition first.
 
 ```text
-# src/Controller/Firewall.php
-L42:public function __construct(){$this->register_routes();}
-L89:add_action('init',[$this,'ip_lockout']);
+# wp-includes/pluggable.php
+[def]
+L744:function wp_logout() {
+L745:$user_id = get_current_user_id();
+L759:do_action( 'wp_logout', $user_id );
+L760:}
+L738:if ( ! function_exists( 'wp_logout' ) ) :
+# wp-login.php
+L799:wp_logout();
 ```
 
-A search returns at most 10 files and 8 lines per file.
+A search returns at most 10 files and 8 plain lines per file. Code search marks truncated or stale results with these lines:
+
+| Marker | Meaning |
+| :--- | :--- |
+| `[+N more lines]` | This file has `N` more matching lines. |
+| `[showing N of M files]` | More files match the query. `M+` means at least `M` files match. |
+| `[cut at 80 lines: ...]` | The definition continues in the source file. |
+| `[STALE: ...]` | The file changed or was deleted after indexing. Run `cs index`. |
+| `NO MATCHES ...` | No file has a whole-identifier match. |
+| `ERROR: ...` | The search or index failed. In MCP mode, code search also sets `isError: true`. |
 
 ## Ignore rules
 
-`cs` reads `.csignore` files in the searched directory tree. They use `.gitignore` syntax. `cs` does not read `.gitignore`, and it does not skip hidden files, so list `.git/` and `.code-index/` yourself:
+Code search reads `.csignore` files in the searched directory tree using `.gitignore` syntax. Code search does not read `.gitignore` and does not skip hidden files. It always skips `.git` and `.code-index`. Add any other paths you want to skip to `.csignore`:
 
 ```gitignore
-.git/
-.code-index/
 target/
 node_modules/
 *.min.js
@@ -49,23 +62,25 @@ node_modules/
 
 ## Queries
 
-- Terms separated by spaces are OR'd.
-- One identifier such as `register_routes` or `ip-lockout` matches as a whole.
-- A query that contains `:` returns nothing. Search `Foo bar` instead of `Foo::bar`.
-- A folder after the query limits the results to files under that folder. The folder is relative to the directory that was indexed.
+- Code search splits terms on punctuation and requires every term. `Foo::bar` and `Foo bar` run the same query.
+- Terms match whole identifiers without case sensitivity. `wp_logout` does not match `wp_logout_url` or `wp-logout`.
+- Code search shows lines that contain every term. If no line contains every term, code search shows lines that contain any term.
+- A folder argument after the query limits the results to files under that folder, relative to the indexed directory.
 
 ## MCP tools
 
 | Tool | Arguments | Result |
 | :--- | :--- | :--- |
-| `search_code` | `query` (string), optional `folder` (string) | Same text as the CLI search |
+| `search_code` | `query` string, optional `folder` string | Same text as the CLI search |
 | `index_code` | none | Rebuilds the index |
+
+A failed call returns `ERROR: ...` with `isError: true`. An unknown tool returns an error, and an unknown method returns a JSON-RPC `-32601` reply.
 
 ### Register the server
 
-The server searches the directory it starts in, so each client must start it in the directory you want to search. Replace `/path/to/cs` with the binary and `/path/to/project` with that directory.
+The server searches the directory it starts in, so each client must start it in the directory you want to search. Replace `/path/to/cs` with the binary path and `/path/to/project` with that directory.
 
-Claude Code, `.mcp.json` in the project root (Claude Code starts the server in the project):
+For Claude Code, create `.mcp.json` in the project root. Claude Code starts the server in the project directory:
 
 ```json
 {
@@ -75,7 +90,7 @@ Claude Code, `.mcp.json` in the project root (Claude Code starts the server in t
 }
 ```
 
-Codex, `.codex/config.toml` in a trusted project, or `~/.codex/config.toml`:
+For Codex, add this section to `.codex/config.toml` in a trusted project or to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.cs]
@@ -84,7 +99,7 @@ args = ["mcp"]
 cwd = "/path/to/project"
 ```
 
-Antigravity, the global `~/.gemini/config/mcp_config.json` (older versions: `~/.gemini/antigravity/mcp_config.json`). Add `cs` inside the existing `mcpServers` object:
+For Antigravity, edit `~/.gemini/config/mcp_config.json`, or `~/.gemini/antigravity/mcp_config.json` on older versions. Add `cs` to the `mcpServers` object:
 
 ```json
 {
@@ -107,13 +122,16 @@ docker run --rm -v "$PWD:/workspace" cs "add_action"
 
 Run `docker build` in this folder. Run `docker run` in the directory you want to search.
 
-With Compose, run these in the directory you want to search and point `-f` at this folder:
+With Docker Compose, run these commands in the directory you want to search and point `-f` at this folder:
 
 ```bash
-docker compose -f cs/docker-compose.yml run --rm cs index
-docker compose -f cs/docker-compose.yml run --rm cs "add_action"
+docker compose -f code-index/docker-compose.yml run --rm cs index
+docker compose -f code-index/docker-compose.yml run --rm cs "add_action"
 ```
 
 ## Limits
 
-The minifier does not parse strings. It cuts a line at `//`, also inside a URL, and at a `#` that starts a line or follows a space. Read the real file before you quote or edit code from a result.
+- Code search strips comments based on the file extension. It strips `//` and `/* */` in `php`, `js`, `jsx`, `mjs`, `ts`, `tsx`, `rs`, `c`, `h`, `cpp`, `java`, `go`, `scss`, and `less` files. It strips `#` at the start of a line or after a space, except `#[`, in `php`, `py`, `sh`, `rb`, `yml`, `yaml`, and `toml` files. Other files keep every line.
+- Code search tracks quotes per line and keeps comment markers inside strings. A string that spans multiple lines or a Rust lifetime such as `'a` can leave a trailing comment in the index.
+- Code search trims lines without reformatting them. Because the output omits indentation and comments, read the original file before you quote or edit code.
+- Code search finds the end of a definition block by counting braces. Braces inside strings can end a block early or late. For languages without braces, code search shows the `def` line and the two lines after it.

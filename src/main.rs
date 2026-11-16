@@ -1,57 +1,90 @@
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::{env, fs, io::{self, BufRead, Write}, ops::Bound, path::Path};
-use tantivy::{collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery}, schema::{Value as _, *}, Index, ReloadPolicy, Term};
+use tantivy::{collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery}, schema::{Value as _, *}, Index, ReloadPolicy, Term, TantivyError};
 
 const INDEX_DIR: &str = ".code-index";
+const MAX_LINES: usize = 8;
+const MAX_BLOCK: usize = 80;
 
-fn compact_code(src: &str) -> String {
+fn compact_code(src: &str, ext: &str) -> String {
+    let slash = matches!(ext, "php" | "js" | "jsx" | "mjs" | "ts" | "tsx" | "rs" | "c" | "h" | "cpp" | "java" | "go" | "scss" | "less");
+    let hash = matches!(ext, "php" | "py" | "sh" | "rb" | "yml" | "yaml" | "toml");
     let mut out = String::new();
     let mut in_block = false;
     for (idx, raw_line) in src.lines().enumerate() {
+        let b = raw_line.as_bytes();
         let mut line = Vec::new();
-        let bytes = raw_line.as_bytes();
+        // Context: comment markers inside quotes are code (URLs, globs, regex), so quotes are tracked per line.
+        let mut quote = None;
         let mut i = 0;
-        while i < bytes.len() {
+        while i < b.len() {
+            let next = b.get(i + 1).copied();
             if in_block {
-                if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                if b[i] == b'*' && next == Some(b'/') {
                     in_block = false;
-                    i += 2;
-                } else {
                     i += 1;
                 }
-            } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            } else if let Some(q) = quote {
+                line.push(b[i]);
+                if b[i] == b'\\' {
+                    if let Some(n) = next {
+                        line.push(n);
+                        i += 1;
+                    }
+                } else if b[i] == q {
+                    quote = None;
+                }
+            } else if slash && b[i] == b'/' && next == Some(b'*') {
                 in_block = true;
-                i += 2;
-            } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                i += 1;
+            } else if slash && b[i] == b'/' && next == Some(b'/') {
                 break;
-            } else if bytes[i] == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            } else if hash && b[i] == b'#' && next != Some(b'[') && (i == 0 || b[i - 1].is_ascii_whitespace()) {
                 break;
             } else {
-                line.push(bytes[i]);
-                i += 1;
+                if matches!(b[i], b'\'' | b'"' | b'`') {
+                    quote = Some(b[i]);
+                }
+                line.push(b[i]);
             }
+            i += 1;
         }
         let line = String::from_utf8_lossy(&line);
-        let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        let minified = collapsed
-            .replace(" { ", "{")
-            .replace(" {", "{")
-            .replace("{ ", "{")
-            .replace(" } ", "}")
-            .replace(" }", "}")
-            .replace("; ", ";")
-            .replace(", ", ",")
-            .replace(" = ", "=")
-            .replace(" ( ", "(")
-            .replace(" (", "(")
-            .replace("( ", "(")
-            .replace(" )", ")");
-        if !minified.is_empty() {
-            out.push_str(&format!("L{}:{}\n", idx + 1, minified));
+        let line = line.trim();
+        if !line.is_empty() {
+            out.push_str(&format!("L{}:{line}\n", idx + 1));
         }
     }
     out
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn has_word(line: &str, term: &str) -> bool {
+    line.match_indices(term).any(|(i, _)| {
+        !line[..i].chars().next_back().is_some_and(is_ident) && !line[i + term.len()..].chars().next().is_some_and(is_ident)
+    })
+}
+
+fn is_def(line: &str, term: &str) -> bool {
+    ["function ", "function &", "class ", "interface ", "trait ", "enum ", "struct ", "fn ", "def "]
+        .iter()
+        .any(|kw| has_word(line, &format!("{kw}{term}")))
+}
+
+fn block_end(lines: &[&str], start: usize) -> usize {
+    let (mut depth, mut seen) = (0i32, false);
+    for (n, l) in lines.iter().enumerate().skip(start).take(MAX_BLOCK) {
+        depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+        seen |= l.contains('{');
+        if depth <= 0 && (seen || l.ends_with(';') || n - start >= 2) {
+            return n + 1;
+        }
+    }
+    (start + MAX_BLOCK).min(lines.len())
 }
 
 fn open_or_create_index() -> tantivy::Result<(Index, Field, Field)> {
@@ -73,12 +106,14 @@ fn build_index() -> tantivy::Result<usize> {
     let walker = WalkBuilder::new(".")
         .standard_filters(false)
         .add_custom_ignore_filename(".csignore")
+        .filter_entry(|e| !matches!(e.file_name().to_str(), Some(".git" | INDEX_DIR)))
         .build();
     for entry in walker.flatten() {
         let p = entry.path();
         if p.is_file() {
             if let Ok(text) = fs::read_to_string(p) {
-                let compacted = compact_code(&text);
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let compacted = compact_code(&text, ext);
                 if !compacted.is_empty() {
                     let rel = p.strip_prefix("./").unwrap_or(p).to_string_lossy();
                     writer.add_document(doc!(f_path => rel.as_ref(), f_body => compacted))?;
@@ -92,14 +127,25 @@ fn build_index() -> tantivy::Result<usize> {
 }
 
 fn search(query_str: &str, folder: &str, limit: usize) -> tantivy::Result<String> {
-    if !Path::new(INDEX_DIR).join("meta.json").exists() {
+    let meta = Path::new(INDEX_DIR).join("meta.json");
+    if !meta.exists() {
         build_index()?;
+    }
+    let indexed_at = fs::metadata(&meta)?.modified()?;
+    let q_terms: Vec<String> = query_str
+        .split(|c: char| !is_ident(c))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    if q_terms.is_empty() {
+        return Ok("NO MATCHES: query has no identifier characters\n".into());
     }
     let (index, f_path, f_body) = open_or_create_index()?;
     let reader = index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?;
     let searcher = reader.searcher();
-    let qp = QueryParser::for_index(&index, vec![f_path, f_body]);
-    let (q, _) = qp.parse_query_lenient(query_str);
+    let mut qp = QueryParser::for_index(&index, vec![f_body]);
+    qp.set_conjunction_by_default();
+    let (q, _) = qp.parse_query_lenient(&q_terms.join(" "));
     let folder = folder.trim_start_matches("./").trim_end_matches('/');
     let q: Box<dyn Query> = if folder.is_empty() {
         q
@@ -110,51 +156,88 @@ fn search(query_str: &str, folder: &str, limit: usize) -> tantivy::Result<String
         );
         Box::new(BooleanQuery::new(vec![(Occur::Must, q), (Occur::Must, Box::new(in_folder))]))
     };
-    let top_docs = searcher.search(&q, &TopDocs::with_limit(limit))?;
-    let q_terms: Vec<String> = query_str
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
-        .collect();
+    let fetch = limit * 5;
+    let top_docs = searcher.search(&q, &TopDocs::with_limit(fetch))?;
+    let capped = top_docs.len() == fetch;
 
-    let mut out = String::new();
+    let mut hits: Vec<(bool, String)> = Vec::new();
     for (_score, addr) in top_docs {
         let doc: TantivyDocument = searcher.doc(addr)?;
         let path = doc.get_first(f_path).and_then(|v| v.as_str()).unwrap_or("");
         let body = doc.get_first(f_body).and_then(|v| v.as_str()).unwrap_or("");
-        let matches: Vec<&str> = body
-            .lines()
-            .filter(|line| {
-                let l = line.to_lowercase();
-                q_terms.iter().any(|t| l.contains(t))
-            })
-            .take(8)
-            .collect();
-        if !matches.is_empty() {
-            out.push_str(&format!("# {path}\n{}\n", matches.join("\n")));
+        let lines: Vec<&str> = body.lines().collect();
+        let lower: Vec<String> = lines.iter().map(|l| l.to_lowercase()).collect();
+        let all: Vec<usize> = (0..lines.len()).filter(|&i| q_terms.iter().all(|t| has_word(&lower[i], t))).collect();
+        let idx = if all.is_empty() {
+            (0..lines.len()).filter(|&i| q_terms.iter().any(|t| has_word(&lower[i], t))).collect()
         } else {
-            out.push_str(&format!("# {path}\n"));
+            all
+        };
+        // Context: tokenizer matches wp_logout to wp-logout too; files with no whole-identifier line are dropped.
+        if idx.is_empty() {
+            continue;
         }
+        let (mut defs, mut plain, mut covered) = (String::new(), Vec::new(), 0);
+        for i in idx {
+            if i < covered {
+                continue;
+            }
+            if q_terms.iter().any(|t| is_def(&lower[i], t)) {
+                let end = block_end(&lines, i);
+                defs.push_str(&format!("[def]\n{}\n", lines[i..end].join("\n")));
+                if end - i == MAX_BLOCK {
+                    defs.push_str(&format!("[cut at {MAX_BLOCK} lines: Read the file for the rest]\n"));
+                }
+                covered = end;
+            } else {
+                plain.push(lines[i]);
+            }
+        }
+        // Context: stored line numbers are only valid for files unchanged since the last index_code.
+        let stale = fs::metadata(path).and_then(|m| m.modified()).map_or(true, |t| t > indexed_at);
+        let mut out = format!("# {path}{}\n{defs}", if stale { " [STALE: changed or deleted since index; run index_code]" } else { "" });
+        for l in plain.iter().take(MAX_LINES) {
+            out.push_str(&format!("{l}\n"));
+        }
+        if plain.len() > MAX_LINES {
+            out.push_str(&format!("[+{} more lines]\n", plain.len() - MAX_LINES));
+        }
+        hits.push((!defs.is_empty(), out));
+    }
+    if hits.is_empty() {
+        return Ok(format!("NO MATCHES for whole identifier(s): {}\n", q_terms.join(" ")));
+    }
+    hits.sort_by_key(|(def, _)| !def);
+    let mut out: String = hits.iter().take(limit).map(|(_, s)| s.as_str()).collect();
+    if hits.len() > limit || capped {
+        out.push_str(&format!("[showing {limit} of {}{} files; narrow with folder]\n", hits.len(), if capped { "+" } else { "" }));
     }
     Ok(out)
+}
+
+fn reply(id: Value, body: Value) {
+    let mut msg = json!({"jsonrpc": "2.0", "id": id});
+    msg.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+    let _ = writeln!(io::stdout(), "{msg}");
+    let _ = io::stdout().flush();
 }
 
 fn run_mcp() {
     let stdin = io::stdin();
     for line in stdin.lock().lines().map_while(Result::ok) {
         let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
-        let id = req.get("id").cloned();
-        let resp = match req["method"].as_str().unwrap_or("") {
+        let Some(id) = req.get("id").cloned() else { continue };
+        let result = match req["method"].as_str().unwrap_or("") {
             "initialize" => json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "cs", "version": "0.1.0" }
+                "serverInfo": { "name": "cs", "version": "0.2.0" }
             }),
             "tools/list" => json!({
                 "tools": [
                     {
                         "name": "search_code",
-                        "description": "Search minified code index (.code-index); returns compact # file and L#:code lines",
+                        "description": "Whole-identifier search (all terms required) over a comment-stripped, unindented copy of the code. Output: `# file`, then `[def]` full definition blocks (max 80 lines), then `L#:code` hit lines (max 8/file). Markers: `[+N more lines]`, `[showing N of M files]`, `[STALE]`, `NO MATCHES`. Lines lack comments and indentation: Read the file before quoting, editing, or claiming something is absent.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -166,29 +249,29 @@ fn run_mcp() {
                     },
                     {
                         "name": "index_code",
-                        "description": "Rebuild minified .code-index using .csignore",
+                        "description": "Rebuild .code-index using .csignore",
                         "inputSchema": { "type": "object", "properties": {} }
                     }
                 ]
             }),
-            "tools/call" => match req["params"]["name"].as_str().unwrap_or("") {
-                "index_code" => {
-                    let count = build_index().unwrap_or(0);
-                    json!({ "content": [{ "type": "text", "text": format!("Indexed {count} files") }] })
+            "tools/call" => {
+                let a = &req["params"]["arguments"];
+                let r = match req["params"]["name"].as_str().unwrap_or("") {
+                    "index_code" => build_index().map(|c| format!("Indexed {c} files")),
+                    "search_code" => search(a["query"].as_str().unwrap_or(""), a["folder"].as_str().unwrap_or(""), 10),
+                    n => Err(TantivyError::InvalidArgument(format!("unknown tool: {n}"))),
+                };
+                match r {
+                    Ok(t) => json!({ "content": [{ "type": "text", "text": t }] }),
+                    Err(e) => json!({ "content": [{ "type": "text", "text": format!("ERROR: {e}") }], "isError": true }),
                 }
-                _ => {
-                    let q = req["params"]["arguments"]["query"].as_str().unwrap_or("");
-                    let folder = req["params"]["arguments"]["folder"].as_str().unwrap_or("");
-                    let hits = search(q, folder, 10).unwrap_or_default();
-                    json!({ "content": [{ "type": "text", "text": hits }] })
-                }
-            },
-            _ => continue,
+            }
+            m => {
+                reply(id, json!({ "error": { "code": -32601, "message": format!("Method not found: {m}") } }));
+                continue;
+            }
         };
-        if let Some(id) = id {
-            let _ = writeln!(io::stdout(), "{}", json!({"jsonrpc": "2.0", "id": id, "result": resp}));
-            let _ = io::stdout().flush();
-        }
+        reply(id, json!({ "result": result }));
     }
 }
 
@@ -199,5 +282,26 @@ fn main() {
         Some("mcp") => run_mcp(),
         Some(q) => print!("{}", search(q, args.get(2).map_or("", |s| s.as_str()), 10).unwrap()),
         None => eprintln!("Usage: cs <index | mcp | \"search query\" [folder]>"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check() {
+        let php = "<?php\nfunction wp_logout() {\n  $u = 'https://x.com'; // c\n  # c\n  #[Attr]\n  if ($a) { $b = '/*.php'; }\n}\nwp_logout_url();\n";
+        let c = compact_code(php, "php");
+        assert!(c.contains("L3:$u = 'https://x.com';\n"));
+        assert!(!c.contains("L4:"));
+        assert!(c.contains("L5:#[Attr]") && c.contains("L6:if ($a) { $b = '/*.php'; }"));
+        let lines: Vec<&str> = c.lines().collect();
+        let lower = lines[1].to_lowercase();
+        assert!(is_def(&lower, "wp_logout"));
+        assert_eq!(block_end(&lines, 1), 6);
+        assert!(!has_word("l8:wp_logout_url();", "wp_logout"));
+        assert!(has_word("add_action('wp_logout', 'x')", "wp_logout"));
+        assert!(compact_code("#include <x>\n", "c").contains("#include"));
     }
 }
