@@ -1,7 +1,7 @@
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::{env, fs, io::{self, BufRead, Write}, ops::Bound, path::Path};
-use tantivy::{collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery}, schema::{Value as _, *}, Index, ReloadPolicy, Term, TantivyError};
+use tantivy::{collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, RegexQuery}, schema::{Value as _, *}, Index, ReloadPolicy, Term, TantivyError};
 
 const INDEX_DIR: &str = ".code-index";
 const MAX_LINES: usize = 8;
@@ -126,7 +126,26 @@ fn build_index() -> tantivy::Result<usize> {
     Ok(count)
 }
 
-fn search(query_str: &str, folder: &str, limit: usize) -> tantivy::Result<String> {
+fn path_filters(f_path: Field, folder: &str, ext: &str) -> tantivy::Result<Vec<(Occur, Box<dyn Query>)>> {
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    let folder = folder.trim_start_matches("./").trim_end_matches('/');
+    if !folder.is_empty() {
+        clauses.push((Occur::Must, Box::new(RangeQuery::new(
+            Bound::Included(Term::from_field_text(f_path, &format!("{folder}/"))),
+            Bound::Excluded(Term::from_field_text(f_path, &format!("{folder}/\u{10ffff}"))),
+        ))));
+    }
+    if !ext.is_empty() {
+        // Context: ext is spliced into a regex, so only letters, digits and | are allowed; tantivy-fst regex matches the whole path term.
+        if !ext.chars().all(|c| c.is_ascii_alphanumeric() || c == '|') {
+            return Err(TantivyError::InvalidArgument("ext must look like php or js|jsx".into()));
+        }
+        clauses.push((Occur::Must, Box::new(RegexQuery::from_pattern(&format!(r".*\.({ext})"), f_path)?)));
+    }
+    Ok(clauses)
+}
+
+fn search(query_str: &str, folder: &str, ext: &str, refs: bool, limit: usize) -> tantivy::Result<String> {
     let meta = Path::new(INDEX_DIR).join("meta.json");
     if !meta.exists() {
         build_index()?;
@@ -146,16 +165,9 @@ fn search(query_str: &str, folder: &str, limit: usize) -> tantivy::Result<String
     let mut qp = QueryParser::for_index(&index, vec![f_body]);
     qp.set_conjunction_by_default();
     let (q, _) = qp.parse_query_lenient(&q_terms.join(" "));
-    let folder = folder.trim_start_matches("./").trim_end_matches('/');
-    let q: Box<dyn Query> = if folder.is_empty() {
-        q
-    } else {
-        let in_folder = RangeQuery::new(
-            Bound::Included(Term::from_field_text(f_path, &format!("{folder}/"))),
-            Bound::Excluded(Term::from_field_text(f_path, &format!("{folder}/\u{10ffff}"))),
-        );
-        Box::new(BooleanQuery::new(vec![(Occur::Must, q), (Occur::Must, Box::new(in_folder))]))
-    };
+    let mut clauses = path_filters(f_path, folder, ext)?;
+    clauses.push((Occur::Must, q));
+    let q = BooleanQuery::new(clauses);
     let fetch = limit * 5;
     let top_docs = searcher.search(&q, &TopDocs::with_limit(fetch))?;
     let capped = top_docs.len() == fetch;
@@ -182,7 +194,8 @@ fn search(query_str: &str, folder: &str, limit: usize) -> tantivy::Result<String
             if i < covered {
                 continue;
             }
-            if q_terms.iter().any(|t| is_def(&lower[i], t)) {
+            // Context: refs mode prints a definition as its one signature line instead of the full block.
+            if !refs && q_terms.iter().any(|t| is_def(&lower[i], t)) {
                 let end = block_end(&lines, i);
                 defs.push_str(&format!("[def]\n{}\n", lines[i..end].join("\n")));
                 if end - i == MAX_BLOCK {
@@ -242,9 +255,11 @@ fn run_mcp() {
                             "type": "object",
                             "properties": {
                                 "query": { "type": "string" },
-                                "folder": { "type": "string", "description": "Only return files under this folder, relative to the index root" }
+                                "folder": { "type": "string", "description": "Folder to search, relative to the index root. Plugin code: <plugin>/src. Libraries: <plugin>/vendor. \"\" = whole repo" },
+                                "ext": { "type": "string", "description": "File extensions, | separated, e.g. php or js|jsx. \"\" = all" },
+                                "refs": { "type": "boolean", "description": "true = show definitions as one line (use when listing references)" }
                             },
-                            "required": ["query"]
+                            "required": ["query", "folder"]
                         }
                     },
                     {
@@ -258,7 +273,13 @@ fn run_mcp() {
                 let a = &req["params"]["arguments"];
                 let r = match req["params"]["name"].as_str().unwrap_or("") {
                     "index_code" => build_index().map(|c| format!("Indexed {c} files")),
-                    "search_code" => search(a["query"].as_str().unwrap_or(""), a["folder"].as_str().unwrap_or(""), 10),
+                    "search_code" => search(
+                        a["query"].as_str().unwrap_or(""),
+                        a["folder"].as_str().unwrap_or(""),
+                        a["ext"].as_str().unwrap_or(""),
+                        a["refs"].as_bool().unwrap_or(false),
+                        10,
+                    ),
                     n => Err(TantivyError::InvalidArgument(format!("unknown tool: {n}"))),
                 };
                 match r {
@@ -280,8 +301,8 @@ fn main() {
     match args.get(1).map(|s| s.as_str()) {
         Some("index") => println!("Indexed {} files into {}", build_index().unwrap(), INDEX_DIR),
         Some("mcp") => run_mcp(),
-        Some(q) => print!("{}", search(q, args.get(2).map_or("", |s| s.as_str()), 10).unwrap()),
-        None => eprintln!("Usage: cs <index | mcp | \"search query\" [folder]>"),
+        Some(q) => print!("{}", search(q, args.get(2).map_or("", |s| s.as_str()), args.get(3).map_or("", |s| s.as_str()), false, 10).unwrap()),
+        None => eprintln!("Usage: cs <index | mcp | \"search query\" [folder] [ext]>"),
     }
 }
 
@@ -303,5 +324,23 @@ mod tests {
         assert!(!has_word("l8:wp_logout_url();", "wp_logout"));
         assert!(has_word("add_action('wp_logout', 'x')", "wp_logout"));
         assert!(compact_code("#include <x>\n", "c").contains("#include"));
+    }
+
+    #[test]
+    fn path_filter() {
+        let mut sb = Schema::builder();
+        let p = sb.add_text_field("path", STRING | STORED);
+        let index = Index::create_in_ram(sb.build());
+        let mut w = index.writer(50_000_000).unwrap();
+        for f in ["src/a.js", "src/a.jsx", "src/a.json", "src/a.jsx.map", "src/a.php", "vendor/b.js"] {
+            w.add_document(doc!(p => f)).unwrap();
+        }
+        w.commit().unwrap();
+        let s = index.reader().unwrap().searcher();
+        let n = |folder: &str, ext: &str| s.search(&BooleanQuery::new(path_filters(p, folder, ext).unwrap()), &tantivy::collector::Count).unwrap();
+        assert_eq!(n("src", "js|jsx"), 2);
+        assert_eq!(n("", "js"), 2);
+        assert_eq!(n("src", "php"), 1);
+        assert!(path_filters(p, "", ".*").is_err());
     }
 }
