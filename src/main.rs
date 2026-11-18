@@ -1,3 +1,5 @@
+pub mod chain;
+
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::{env, fs, io::{self, BufRead, Write}, ops::Bound, path::Path};
@@ -300,9 +302,20 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("index") => println!("Indexed {} files into {}", build_index().unwrap(), INDEX_DIR),
+        Some("chain") => {
+            let target = args.get(2).map(|s| s.as_str()).unwrap_or("");
+            if target.is_empty() {
+                eprintln!("Usage: cs chain <method_or_class::method> [path]");
+                return;
+            }
+            let scan_path = args.get(3).map(|s| s.as_str()).unwrap_or(".");
+            let mut scanner = chain::CodebaseChainScanner::new();
+            scanner.scan_dir(Path::new(scan_path));
+            print!("{}", scanner.dump_chain(target));
+        }
         Some("mcp") => run_mcp(),
         Some(q) => print!("{}", search(q, args.get(2).map_or("", |s| s.as_str()), args.get(3).map_or("", |s| s.as_str()), false, 10).unwrap()),
-        None => eprintln!("Usage: cs <index | mcp | \"search query\" [folder] [ext]>"),
+        None => eprintln!("Usage: cs <index | chain <method> [path] | mcp | \"search query\" [folder] [ext]>"),
     }
 }
 

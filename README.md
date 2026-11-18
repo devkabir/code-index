@@ -18,6 +18,7 @@ Run `cs` from the directory you want to search. Code search indexes and searches
 cs index            # build or rebuild the index
 cs "add_action"     # search
 cs "add_action" wp-content/plugins   # search only inside one folder
+cs chain method_name [folder]        # dump chained method definitions
 cs mcp              # run as an MCP server on stdio
 ```
 
